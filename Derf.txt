@@ -1,0 +1,23 @@
+5 Dynamic erf (Derf)
+From the search, we identify erf(x) as the most performant point-wise function. The error function erf(·) is
+closely related to the cumulative distribution function (CDF) of a standard Gaussian distribution. Specifically,
+erf(x) can be defined by Equation 9. In our setup, erf(x) is in the form augmented with learnable parameters,
+which we introduce as Derf, Dynamic erf. Given an input tensor x, a Derf layer is defined in Equation 10,
+where both the shift s and the scale α are learnable scalars. γ and β are learnable per-channel vectors. To
+integrate Derf into a transformer-based architecture, we replace each normalization layer with a corresponding
+Derf layer. In particular, the pre-attention, the pre-FFN, and the final normalization layers are all substituted
+in a one-to-one manner, ensuring consistent incorporation of Derf across the entire model.
+∫
+︁ x
+erf(x) = 2
+√
+π
+e−t2dt
+0
+Derf(x) = γ *erf(αx+s)+β
+(9)
+(10)
+Parameter initialization. We initialize γ to an all-one vector and β to an all-zero vector following the same
+strategy as in standard normalization layers. For the additional scalar parameters introduced by Derf, the
+scaling parameter α is initialized to 0.5, while the shift parameter s is initialized to 0. Unless otherwise
+specified, these initialization settings are adopted throughout all experiments.
