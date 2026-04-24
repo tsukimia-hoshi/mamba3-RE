@@ -1,0 +1,388 @@
+下面是按你最新设定修正后的最终版数学描述。
+
+# 块间因果、块内非因果的 Chunk-MIMO Mamba3
+
+给定输入序列
+
+[
+x_1,\ldots,x_T,\qquad x_t\in\mathbb R^{d_{\mathrm{model}}}.
+]
+
+按 chunk size (L) 分块：
+
+[
+\mathcal C_m={mL,\ldots,mL+L-1},
+\qquad m=0,\ldots,M-1.
+]
+
+对每个 head (h)，每个 token 通过线性投影得到 token 级变量：
+
+[
+q_{m,i}^{(h)},\
+k_{m,i}^{(h)},\
+v_{m,i}^{(h)},\
+r_{m,i}^{(h)},\
+z_{m,i}^{(h)}
+=============
+
+W_{\mathrm{tok}}^{(h)}x_{m,i}.
+]
+
+其中：
+
+[
+q_{m,i}^{(h)} \equiv C_{m,i}^{(h)},
+\qquad
+k_{m,i}^{(h)} \equiv B_{m,i}^{(h)}.
+]
+
+也就是说，(q) 承担原版 SSM 里的读出 (C)，(k) 承担写入 (B)，(v) 是写入状态的 value/input。
+
+---
+
+## 1. Chunk 级 (\Delta)：由卷积直接给出
+
+不同于 (q,k,v,r,z) 的 token 级线性投影，(\Delta) 由原始输入经过卷积得到：
+
+[
+d_m^{(h)}
+=========
+
+\operatorname{Conv}*{L,L}^{(h)}(x)*{m}.
+]
+
+这里卷积核大小和步长都等于 chunk size：
+
+[
+\text{kernel size}=L,
+\qquad
+\text{stride}=L.
+]
+
+因此每个 chunk 直接得到一个 chunk 级 logit：
+
+[
+d_m^{(h)}.
+]
+
+它不在扫描过程中计算，也不由 chunk 内 softmax 汇聚得到，而是作为外部预先计算好的 chunk 级动态步长输入。
+
+再做正值化：
+
+[
+\Delta_m^{(h)}
+==============
+
+\operatorname{softplus}\left(d_m^{(h)}+b_\Delta^{(h)}\right).
+]
+
+若每个 head 还含有 state/channel 维度，也可以写成：
+
+[
+\Delta_m^{(h)}\in\mathbb R^{N}
+]
+
+或简化为每 head 一个标量：
+
+[
+\Delta_m^{(h)}\in\mathbb R.
+]
+
+---
+
+## 2. 固定可学习 (A)
+
+(A) 不由输入生成，而是固定可学习参数：
+
+[
+A^{(h)}=-\exp(A_{\log}^{(h)}).
+]
+
+它在训练中更新，但前向时不随 token 或 chunk 改变。
+
+chunk (m) 的离散衰减因子为：
+
+[
+\Lambda_m^{(h)}
+===============
+
+\exp\left(A^{(h)}\Delta_m^{(h)}\right).
+]
+
+---
+
+## 3. Chunk 内非因果外积权重
+
+每个 token 的外积权重 logit 来自线性投影：
+
+[
+r_{m,i}^{(h)}=w_r^{(h)\top}x_{m,i}.
+]
+
+在同一个 chunk 内做 softmax：
+
+[
+\alpha_{m,i}^{(h)}
+==================
+
+\frac{
+\exp(r_{m,i}^{(h)})
+}{
+\sum_{j\in\mathcal C_m}\exp(r_{m,j}^{(h)})
+}.
+]
+
+因此 chunk 内所有 token 会共同决定一次写入，块内不再保持因果性。
+
+---
+
+## 4. Chunk 级 MIMO 写入项
+
+对每个 head，将 chunk 内多个 value-key 外积加权求和：
+
+[
+U_m^{(h)}
+=========
+
+\sum_{i\in\mathcal C_m}
+\alpha_{m,i}^{(h)}
+v_{m,i}^{(h)}
+{k_{m,i}^{(h)}}^\top.
+]
+
+这是该 chunk 的唯一 SSM 写入项。
+
+原版 token 级形式里可以理解为每步写入
+
+[
+v_t k_t^\top.
+]
+
+你的版本把 chunk 内 (L) 个写入合并成一个：
+
+[
+\sum_i \alpha_i v_i k_i^\top.
+]
+
+因此不再计算块内逐 token 衰减、块内 segsum 或复杂 causal scan。
+
+---
+
+## 5. 每个 chunk 只做一次 SSM 动力学
+
+每个 head 的状态为
+
+[
+S_m^{(h)}.
+]
+
+chunk 级递推为：
+
+[
+\boxed{
+S_m^{(h)}
+=========
+
+\exp\left(A^{(h)}\Delta_m^{(h)}\right)
+S_{m-1}^{(h)}
++
+\Delta_m^{(h)}U_m^{(h)}
+}
+]
+
+也就是：
+
+[
+\boxed{
+S_m^{(h)}
+=========
+
+\Lambda_m^{(h)}S_{m-1}^{(h)}
++
+\Delta_m^{(h)}
+\sum_{i\in\mathcal C_m}
+\alpha_{m,i}^{(h)}
+v_{m,i}^{(h)}
+{k_{m,i}^{(h)}}^\top
+}
+]
+
+这里没有 `trap` 项，也没有额外的 (B) 投影，因为：
+
+[
+B_{m,i}^{(h)}\equiv k_{m,i}^{(h)}.
+]
+
+---
+
+## 6. Token 级门控
+
+门控是 token 级独立的，不是 chunk 级共享：
+
+[
+z_{m,i}^{(h)}=w_z^{(h)\top}x_{m,i}.
+]
+
+门控值为：
+
+[
+g_{m,i}^{(h)}
+=============
+
+\operatorname{silu}\left(z_{m,i}^{(h)}\right).
+]
+
+因此 chunk 内虽然共享同一个更新后的状态 (S_m^{(h)})，但每个 token 有自己的 gate。
+
+---
+
+## 7. Token 级输出
+
+chunk 内第 (i) 个 token 从同一个 chunk 状态读出：
+
+[
+o_{m,i}^{(h)}
+=============
+
+g_{m,i}^{(h)}
+\odot
+\left(
+S_m^{(h)}q_{m,i}^{(h)}
++
+D^{(h)}v_{m,i}^{(h)}
+\right).
+]
+
+其中 (D^{(h)}) 是每个 head 的可学习 direct skip 系数，通常可视为每 head 一个标量，或按 head/channel 的对角参数。
+
+多 head 拼接后输出：
+
+[
+y_{m,i}
+=======
+
+W_o
+\operatorname{Concat}*{h}
+\left(
+o*{m,i}^{(h)}
+\right).
+]
+
+若有 block 外层残差，则：
+
+[
+x_{m,i}^{\ell+1}
+================
+
+x_{m,i}^{\ell}
++
+y_{m,i}.
+]
+
+---
+
+# 最终极简公式
+
+对每个 head (h)：
+
+[
+q_{m,i},k_{m,i},v_{m,i},r_{m,i},z_{m,i}
+=======================================
+
+W_{\mathrm{tok}}x_{m,i},
+]
+
+[
+d_m
+===
+
+\operatorname{Conv}_{L,L}(x)_m,
+\qquad
+\Delta_m
+========
+
+\operatorname{softplus}(d_m+b_\Delta),
+]
+
+[
+\alpha_{m,i}
+============
+
+\operatorname{softmax}*{i\in\mathcal C_m}(r*{m,i}),
+]
+
+[
+U_m
+===
+
+\sum_{i\in\mathcal C_m}
+\alpha_{m,i}v_{m,i}k_{m,i}^{\top},
+]
+
+[
+\boxed{
+S_m
+===
+
+\exp(A\Delta_m)S_{m-1}
++
+\Delta_m U_m
+}
+]
+
+[
+\boxed{
+o_{m,i}
+=======
+
+\operatorname{silu}(z_{m,i})
+\odot
+\left(
+S_mq_{m,i}
++
+Dv_{m,i}
+\right)
+}
+]
+
+其中：
+
+[
+A=-\exp(A_{\log})
+]
+
+是固定可学习衰减参数；
+
+[
+\Delta_m
+]
+
+是由 chunk 卷积直接产生的 chunk 级动态步长；
+
+[
+r_{m,i}
+]
+
+是 token 级 chunk 内汇聚 logit；
+
+[
+z_{m,i}
+]
+
+是 token 级独立门控；
+
+[
+k_{m,i}
+]
+
+承担原版 (B)；
+
+[
+q_{m,i}
+]
+
+承担原版 (C)。
+
+一句话总结：
+
+> 该结构将 Mamba3 的 token 级 selective scan 改为 chunk 级 scan：每个 chunk 内由 token 级 logits 对 (v_i k_i^\top) 做 softmax 加权汇聚，形成唯一写入项 (U_m)；(\Delta_m) 由 kernel size 和 stride 都等于 chunk size 的卷积直接给出；(A) 保持固定可学习；每个 chunk 只执行一次状态更新，而 chunk 内 token 共享更新后的状态、但保留各自独立的 (q,k,v,r,z) 与门控。
