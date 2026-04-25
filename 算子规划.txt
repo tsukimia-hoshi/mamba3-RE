@@ -1,422 +1,289 @@
-
-
-
-下面是按你最新设定修正后的最终版数学描述。
-
-# 块间因果、块内非因果的 Chunk-MIMO Mamba3
-
-给定输入序列
-
+下面是按你最新口径整理后的 新版算子规划。
+仓库里的 mamba3.py 原版大致是：in_proj 一次性投影出 [z, x, B, C, dd_dt, dd_A, trap, angle]，其中 dd_dt 和 dd_A 都是 token 级；A=-softplus(dd_A)，DT=softplus(dd_dt+dt_bias)；同时保留 trap、data-based RoPE angle、B/C RMSNorm。 你原始规划则已经把结构改成 chunk 级 scan：chunk 内聚合写入项 (U_m)，chunk 间只做一次状态递推。
+至于MIMO/SISO，在这版里不再区分，如果非要理解，可以理解为：1、一个chunk只有一步，但有门控MIMO；2、或者也可以理解为抛弃了chunk内动力学的SISO。
+新版算子：Chunk-level Delta/A + Token Write Gate Mamba3
+0. 总体目标
+新版算子仍然以 mamba3-RE 的 Mamba3 模块为主体，尽量保留原版的：
 [
-x_1,\ldots,x_T,\qquad x_t\in\mathbb R^{d_{\mathrm{model}}}.
+z,\ x/V,\ B/K,\ C/Q,\ D,\ B/C\ \text{bias},\ B/C\ \text{norm},\ MIMO/SISO\ \text{结构},\ out_proj
 ]
-
-本版使用Derf代替任何norm，Derf概念在Derf.txt里有介绍。
-
-之后按 chunk size (L) 分块：
-
+但针对高分辨率图像特征和低照 RAW 去噪，做以下核心改动：
+1.	(\Delta) 从 token 级改为 chunk 级。
+原版每个 token 生成 dd_dt；新版每个 chunk 生成一次 dd_dt_m。
+2.	(\Delta) 由卷积生成的块级特征得到。
+不再由 token 级 in_proj 直接给出。
+3.	dd_A 也改为 chunk 级，由块级特征得到。
+原版 dd_A 是 token 级；新版每个 chunk 只有一个 dd_A_m。
+4.	不要 trap。
+删除原版投影里的 trap 分支，kernel 里也不再传入 Trap。
+5.	不要 data-based RoPE。
+删除原版由 angle 分支生成的 data-based rotary angle，不维护 angle_state，不调用 data-dependent RoPE。
+6.	chunk 内 token 使用独立写入门控。
+不再 softmax，也不要求破坏 token 独立可加性。每个 token 自己生成写入 gate，类似原版 (\Delta) 的 logits → activation 方式。
+7.	所有原版 norm 位置加开关。
+可以保留原版 RMSNorm / RMSNormGated，也可以切换为 Derf。
+________________________________________
+1. 输入与分块
+输入序列：
+[
+x_1,\ldots,x_T,\qquad x_t\in\mathbb R^{d_{\text{model}}}
+]
+按 chunk size (L) 分块：
 [
 \mathcal C_m={mL,\ldots,mL+L-1},
-\qquad m=0,\ldots,M-1.
+\qquad m=0,\ldots,M-1
 ]
-
-对每个 head (h)，每个 token 通过线性投影得到 token 级变量：
-
+对图像特征，可以把 2D feature map flatten 成序列，也可以按局部窗口/patch 形成 chunk。
+________________________________________
+2. Token 级投影：保留原版主体
+原版 mamba3-RE 投影顺序是：
 [
-q_{m,i}^{(h)},\
-k_{m,i}^{(h)},\
-v_{m,i}^{(h)},\
-r_{m,i}^{(h)},\
-z_{m,i}^{(h)}
-=============
-
-W_{\mathrm{tok}}^{(h)}x_{m,i}.
+[z,\ x,\ B,\ C,\ dd_dt,\ dd_A,\ trap,\ angle]
 ]
-
+新版改成：
+[
+[z,\ v,\ B,\ C,\ r]
+W_{\text{tok}}x
+]
 其中：
-
 [
-q_{m,i}^{(h)} \equiv C_{m,i}^{(h)},
-\qquad
-k_{m,i}^{(h)} \equiv B_{m,i}^{(h)}.
+v \equiv x_{\text{ssm}}
 ]
-
-也就是说，(q) 承担原版 SSM 里的读出 (C)，(k) 承担写入 (B)，(v) 是写入状态的 value/input。
-
----
-
-## 1. Chunk 级 (\Delta)：由卷积直接给出
-
-不同于 (q,k,v,r,z) 的 token 级线性投影，(\Delta) 的logits由原始输入经过卷积得到：
-
 [
-d_m^{(h)}
-=========
-
-\operatorname{Conv}*{L,L}^{(h)}(x)*{m}.
+B \equiv K
 ]
-
-这里卷积核大小和步长都等于 chunk size：
-
 [
-\text{kernel size}=L,
-\qquad
-\text{stride}=L.
+C \equiv Q
 ]
-
-因此每个 chunk 直接得到一个 chunk 级 logit：
-
 [
-d_m^{(h)}.
+r \equiv \text{token write-gate logits}
 ]
-
-它不在扫描过程中计算，而是作为外部预先计算好的 chunk 级动态步长输入。
-
-再做正值化：
-
+也就是说，原版里的 x 仍然作为 value/input 使用；B 和 C 仍然对应写入/读出方向；z 仍然作为输出 gate。
+新版 token 级投影里 不再包含：
 [
-\Delta_m^{(h)}
-==============
-
-\operatorname{softplus}\left(d_m^{(h)}+b_\Delta^{(h)}\right).
+dd_dt,\quad dd_A,\quad trap,\quad angle
 ]
-
-若每个 head 还含有 state/channel 维度，也可以写成：
-
+其中 dd_dt 和 dd_A 移到 chunk 级卷积分支；trap 和 angle 直接删除。
+________________________________________
+3. Chunk 级特征生成
+对输入特征做 chunk-level convolution：
 [
-\Delta_m^{(h)}\in\mathbb R^{N}
+f_m=\operatorname{Conv}_{L,L}(x)_m
 ]
-
-或简化为每 head 一个标量：
-
+其中 kernel size 和 stride 都等于 chunk size：
 [
-\Delta_m^{(h)}\in\mathbb R.
+\text{kernel size}=L,\qquad \text{stride}=L
 ]
-
----
-
-## 2. 固定可学习 (A)
-
-(A) 不由输入生成，而是固定可学习参数：
-
+这个 (f_m) 是当前 chunk 的块级特征，用来生成：
 [
-A^{(h)}=-\exp(A_{\log}^{(h)}).
+dd_dt_m,\qquad dd_A_m
 ]
-
-它在训练中更新，但前向时不随 token 或 chunk 改变。
-
-chunk (m) 的离散衰减因子为：
-
+可以写成：
 [
-\Lambda_m^{(h)}
-===============
-
-\exp\left(A^{(h)}\Delta_m^{(h)}\right).
+dd_dt_m=W_{\Delta}f_m
 ]
-
----
-
-## 3. Chunk 内非因果外积权重
-
-每个 token 的外积权重 logit 来自线性投影：
-
 [
-r_{m,i}^{(h)}=w_r^{(h)\top}x_{m,i}.
+dd_A_m=W_A f_m
 ]
-
-在同一个 chunk 内做 chunk-mean sigmoid：
-
-a
-m,i
-	​
-
-=σ(r
-m,i
-	​
-
-−
-r
-ˉ
-m
-	​
-
-+b)
-r
-ˉ
-m
-	​
-
-=
-L
-1
-	​
-
-j∈C
-m
-	​
-
-∑
-	​
-
-r
-m,j
-	​
-
-U
-m
-	​
-
-=
-L
-1
-	​
-
-i∈C
-m
-	​
-
-∑
-	​
-
-a
-m,i
-	​
-
-v
-m,i
-	​
-
-k
-m,i
-⊤
-	​
-
-
-因此 chunk 内所有 token 会共同决定一次写入，块内不再保持因果性。
-
----
-
-## 4. Chunk 级 MIMO 写入项
-
-对每个 head，将 chunk 内多个 value-key 外积加权求和：
-
-a
-i
-	​
-
-=σ(r
-i
-	​
-
-−
-r
-ˉ
-+b)
-U=
-L
-1
-	​
-
-i
-∑
-	​
-
-a
-i
-	​
-
-v
-i
-	​
-
-k
-i
-⊤
-	​
-
-
-这是该 chunk 的唯一 SSM 写入项。
-
-原版 token 级形式里可以理解为每步写入
-
+或用一个 combined projection：
 [
-v_t k_t^\top.
+[dd_dt_m,\ dd_A_m]=W_{\text{chunk}}f_m
 ]
-
-你的版本把 chunk 内 (L) 个写入合并成一个：
-
+________________________________________
+4. Chunk 级 (\Delta_m)
+原版 mamba3-RE 中：
 [
-\sum_i \alpha_i v_i k_i^\top.
+DT_t=\operatorname{softplus}(dd_dt_t+dt_bias)
 ]
-
-因此不再计算块内逐 token 衰减、块内 segsum 或复杂 causal scan。
-
----
-
-## 5. 每个 chunk 只做一次 SSM 动力学
-
-每个 head 的状态为
-
+新版改为 chunk 级：
 [
-S_m^{(h)}.
-]
-
-chunk 级递推为：
-
-[
-\boxed{
-S_m^{(h)}
-=========
-
-\exp\left(A^{(h)}\Delta_m^{(h)}\right)
-S_{m-1}^{(h)}
-+
-\Delta_m^{(h)}U_m^{(h)}
-}
-]
-
-也就是：
-
-[
-\boxed{
-S_m^{(h)}
-=========
-
-\Lambda_m^{(h)}S_{m-1}^{(h)}
-+
-\Delta_m^{(h)}
-\sum_{i\in\mathcal C_m}
-\alpha_{m,i}^{(h)}
-v_{m,i}^{(h)}
-{k_{m,i}^{(h)}}^\top
-}
-]
-
-这里没有 `trap` 项，也没有额外的 (B) 投影，因为：
-
-[
-B_{m,i}^{(h)}\equiv k_{m,i}^{(h)}.
-]
-
----
-
-## 6. Token 级门控
-
-门控是 token 级独立的，不是 chunk 级共享：
-
-[
-z_{m,i}^{(h)}=w_z^{(h)\top}x_{m,i}.
-]
-
-门控值为：
-
-[
-g_{m,i}^{(h)}
-=============
-
-\operatorname{silu}\left(z_{m,i}^{(h)}\right).
-]
-
-因此 chunk 内虽然共享同一个更新后的状态 (S_m^{(h)})，但每个 token 有自己的 gate。
-
----
-
-## 7. Token 级输出
-
-chunk 内第 (i) 个 token 从同一个 chunk 状态读出：
-
-[
-o_{m,i}^{(h)}
-=============
-
-g_{m,i}^{(h)}
-\odot
-\left(
-S_m^{(h)}q_{m,i}^{(h)}
-+
-D^{(h)}v_{m,i}^{(h)}
-\right).
-]
-
-其中 (D^{(h)}) 是每个 head 的可学习 direct skip 系数，通常可视为每 head 一个标量，或按 head/channel 的对角参数。
-
-多 head 拼接后输出：
-
-[
-y_{m,i}
-=======
-
-W_o
-\operatorname{Concat}*{h}
-\left(
-o*{m,i}^{(h)}
-\right).
-]
-
-若有 block 外层残差，则：
-
-[
-x_{m,i}^{\ell+1}
-================
-
-x_{m,i}^{\ell}
-+
-y_{m,i}.
-]
-
----
-
-# 最终极简公式
-
-对每个 head (h)：
-
-[
-q_{m,i},k_{m,i},v_{m,i},r_{m,i},z_{m,i}
-=======================================
-
-W_{\mathrm{tok}}x_{m,i},
-]
-
-[
-d_m
-===
-
-\operatorname{Conv}_{L,L}(x)_m,
-\qquad
 \Delta_m
-========
-
-\operatorname{softplus}(d_m+b_\Delta),
+\operatorname{softplus}(dd_dt_m+b_{\Delta})
 ]
-
+这里：
 [
-am,i​=σ(rm,i​−rˉm​+b)
+\Delta_m\in\mathbb R^{H}
 ]
-
+或按实现需要扩展成：
+[
+\Delta_m\in\mathbb R^{H\times N}
+]
+最直接的版本是每 head 一个 (\Delta_m)。
+chunk 内所有 token 共享同一个 (\Delta_m)。
+________________________________________
+5. Chunk 级 (A_m)
+原版中：
+[
+A_t=-\operatorname{softplus}(dd_A_t)
+]
+并做 clamp：
+[
+A_t=\operatorname{clamp}(A_t,\ \max=-A_{\text{floor}})
+]
+新版改为 chunk 级：
+[
+A_m
+-\operatorname{softplus}(dd_A_m)
+]
+[
+A_m
+\operatorname{clamp}(A_m,\ \max=-A_{\text{floor}})
+]
+所以离散衰减项为：
+[
+\Lambda_m
+\exp(A_m\Delta_m)
+]
+或者按原版 kernel 变量命名：
+[
+ADT_m=A_m\Delta_m
+]
+关键变化是：
+dd_A 不再是 token 级动态参数，而是由 chunk 卷积特征生成的块级动态参数。
+________________________________________
+6. 删除 trap
+原版 mamba3-RE 里有：
+[
+trap
+]
+并传入 Mamba3 kernel。新版直接删除：
+[
+trap \quad \text{removed}
+]
+因此状态更新不使用 exponential-trapezoidal 修正项，只保留基础 chunk-level recurrence。
+实现上对应：
+•	in_proj 输出维度去掉 self.nheads 的 trap 部分；
+•	forward split 不再 split trap；
+•	kernel API 不再传 Trap=trap；
+•	step/inference 路径也去掉 trap。
+________________________________________
+7. 删除 data-based RoPE
+原版 mamba3-RE 中存在 angle 分支，并在 inference step 里调用 data-dependent rotary 相关逻辑。新版删除：
+[
+angle
+]
+[
+Angles
+]
+[
+angle_state
+]
+[
+apply_rotary_qk_inference_fwd
+]
+即：
+不再由输入数据生成 RoPE angle，也不在 SSM 的 (B/C) 或 (Q/K) 上使用 data-based RoPE。
+如果后续需要位置编码，建议放在算子外部，例如普通 2D positional embedding、坐标 bias、窗口相对位置偏置等，而不是保留 Mamba3-RE 的 data-based RoPE 分支。
+________________________________________
+8. Chunk 内 token 独立写入门控
+原始规划里 chunk 内写入使用 softmax 权重：
 [
 U_m
-===
-
 \sum_{i\in\mathcal C_m}
-\alpha_{m,i}v_{m,i}k_{m,i}^{\top},
+\alpha_{m,i}
+v_{m,i}k_{m,i}^{\top}
 ]
-
+新版改成 token 独立写入 gate。
+每个 token 生成 gate logit：
+[
+r_{m,i}=w_r^\top x_{m,i}
+]
+然后类似原版 (\Delta) 的激活方式，得到正值写入门控：
+[
+g_{m,i}
+\operatorname{softplus}(r_{m,i}+b_g)
+]
+如果你想让 gate 有界，也可以换成：
+[
+g_{m,i}=\sigma(r_{m,i})
+]
+chunk 写入项：
+[
+U_m
+\frac{1}{L}
+\sum_{i\in\mathcal C_m}
+g_{m,i}
+v_{m,i}k_{m,i}^{\top}
+]
+如果对应 mamba3-RE 记号：
+[
+k_{m,i}\equiv B_{m,i}
+]
+[
+q_{m,i}\equiv C_{m,i}
+]
+[
+v_{m,i}\equiv x_{m,i}^{\text{ssm}}
+]
+则：
+[
+U_m
+\frac{1}{L}
+\sum_{i\in\mathcal C_m}
+g_{m,i}
+x_{m,i}^{\text{ssm}}
+B_{m,i}^{\top}
+]
+也不强行做 token 间竞争。chunk 内是非因果、独立可加写入；chunk 间由 SSM 动力学负责动态传播。
+________________________________________
+9. Chunk 级状态递推
+对每个 head，状态为：
+[
+S_m
+]
+新版状态更新为：
 [
 \boxed{
 S_m
-===
-
-\exp(A\Delta_m)S_{m-1}
+\exp(A_m\Delta_m)S_{m-1}
 +
 \Delta_m U_m
 }
 ]
-
+即：
+[
+\boxed{
+S_m
+\Lambda_mS_{m-1}
++
+\Delta_m
+\frac{1}{L}
+\sum_{i\in\mathcal C_m}
+g_{m,i}
+v_{m,i}k_{m,i}^{\top}
+}
+]
+其中：
+[
+\Lambda_m=\exp(A_m\Delta_m)
+]
+[
+A_m=-\operatorname{softplus}(dd_A_m)
+]
+[
+\Delta_m=\operatorname{softplus}(dd_dt_m+b_\Delta)
+]
+________________________________________
+10. Token 级读出与输出 gate
+chunk 内所有 token 共享更新后的状态 (S_m)，但每个 token 仍然有自己的 (C/q)、(v)、(z)。
+读出：
+[
+y_{m,i}
+S_m q_{m,i}
++
+D v_{m,i}
+]
+输出 gate 保留原版风格：
+[
+o_{m,i}
+\operatorname{silu}(z_{m,i})
+\odot
+y_{m,i}
+]
+即：
 [
 \boxed{
 o_{m,i}
-=======
-
 \operatorname{silu}(z_{m,i})
 \odot
 \left(
@@ -426,45 +293,132 @@ Dv_{m,i}
 \right)
 }
 ]
-
-其中：
-
+如果开启原版 outproj norm，则先 norm/gated norm 再 out projection；如果关闭，则直接：
 [
-A=-\exp(A_{\log})
+y_{\text{out}}=W_o o
 ]
-
-是固定可学习衰减参数；
-
+________________________________________
+11. Norm / Derf 开关
+mamba3-RE 原版里至少有：
+•	(B) norm；
+•	(C) norm；
+•	optional out projection norm；
+•	gated RMSNorm 相关路径。
+新版要求：
+在原版任何 norm 位置上添加开关，可以选择保留原版 norm，也可以改为 Derf。
+可以抽象为：
+[
+\operatorname{NormSwitch}(x)=
+\begin{cases}
+\operatorname{RMSNorm}(x), & \text{use_derf_norm=False}\
+\operatorname{Derf}(x), & \text{use_derf_norm=True}
+\end{cases}
+]
+所以：
+[
+B \leftarrow \operatorname{NormSwitch}_B(B)
+]
+[
+C \leftarrow \operatorname{NormSwitch}_C(C)
+]
+out projection norm 位置：
+[
+y \leftarrow \operatorname{NormSwitch}_{out}(y,z)
+]
+需要注意的是，Derf 不是严格 normalization，而是 norm replacement / elementwise saturating transform。因此最好每个位置独立开关，而不是全局一刀切：
+use_derf_BC_norm
+use_derf_out_norm
+use_derf_pre_norm
+________________________________________
+12. 与 mamba3-RE 的差异清单
+模块	mamba3-RE 原版	新版算子
+dd_dt / (\Delta)	token 级，由 in_proj 得到	chunk 级，由卷积块特征得到
+dd_A / (A)	token 级，由 in_proj 得到	chunk 级，由卷积块特征得到
+trap	保留并传入 kernel	删除
+data-based RoPE / angle	保留，输入生成 angle	删除
+chunk 内写入	原版 token 级 SSM 动力学	chunk 内独立 gate 加权可加写入
+写入 gate	无单独 chunk-write gate	(g_i=\operatorname{softplus}(r_i+b_g)) 或 sigmoid
+(B/C) norm	RMSNormGated	加开关，可换 Derf
+out norm	optional RMSNormGated	加开关，可换 Derf
+MIMO/SISO 主结构	保留	基本保留
+(D) skip	保留	保留
+(z) gate	保留	保留
+out projection	保留	保留
+		
+________________________________________
+13. 最终极简公式
+对每个 chunk (m)、每个 token (i\in\mathcal C_m)：
+[
+z_{m,i},v_{m,i},k_{m,i},q_{m,i},r_{m,i}
+W_{\text{tok}}x_{m,i}
+]
+其中：
+[
+k_{m,i}\equiv B_{m,i}
+]
+[
+q_{m,i}\equiv C_{m,i}
+]
+chunk 级特征：
+[
+f_m=\operatorname{Conv}_{L,L}(x)_m
+]
+chunk 级动态参数：
 [
 \Delta_m
+\operatorname{softplus}(W_\Delta f_m+b_\Delta)
 ]
-
-是由 chunk 卷积直接产生的 chunk 级动态步长；
-
 [
-r_{m,i}
+A_m
+-\operatorname{softplus}(W_A f_m)
 ]
-
-是 token 级 chunk 内汇聚 logit；
-
 [
-z_{m,i}
+A_m
+\operatorname{clamp}(A_m,\max=-A_{\text{floor}})
 ]
-
-是 token 级独立门控；
-
+token 写入 gate：
 [
-k_{m,i}
+g_{m,i}
+\operatorname{softplus}(r_{m,i}+b_g)
 ]
-
-承担原版 (B)；
-
+chunk 写入项：
 [
-q_{m,i}
+U_m
+\frac{1}{L}
+\sum_{i\in\mathcal C_m}
+g_{m,i}
+v_{m,i}
+k_{m,i}^{\top}
 ]
+chunk 级状态递推：
+[
+\boxed{
+S_m
+\exp(A_m\Delta_m)S_{m-1}
++
+\Delta_m U_m
+}
+]
+token 输出：
+[
+\boxed{
+o_{m,i}
+\operatorname{silu}(z_{m,i})
+\odot
+\left(
+S_mq_{m,i}
++
+Dv_{m,i}
+\right)
+}
+]
+最终输出：
+[
+y_{m,i}
+W_o o_{m,i}
+]
+________________________________________
+14. 一句话总结新版
+新版算子是一个 mamba3-RE 最小侵入式图像化改造：
+保留原版 Mamba3 的 (z,x/B/C,D,out_proj) 主体，但删除 trap 和 data-based RoPE；将 dd_dt 与 dd_A 从 token 级投影改为由 chunk 卷积特征生成的块级动态参数；chunk 内不再做 token 级因果动力学，而是用 token 独立写入 gate 对 (v_i k_i^\top) 做非因果可加聚合，chunk 间再执行一次 SSM 状态递推；所有原版 norm 位置增加 Derf 替换开关。
 
-承担原版 (C)。
-
-一句话总结：
-
-> 该结构将 Mamba3 的 token 级 selective scan 改为 chunk 级 scan：每个 chunk 内由 token 级 logits 对 (v_i k_i^\top) 做 chunk-mean sigmoid 加权汇聚，形成唯一写入项 (U_m)；(\Delta_m) 由 kernel size 和 stride 都等于 chunk size 的卷积直接给出；(A) 保持固定可学习；每个 chunk 只执行一次状态更新，而 chunk 内 token 共享更新后的状态、但保留各自独立的 (q,k,v,r,z) 与门控。
