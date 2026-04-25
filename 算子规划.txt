@@ -305,7 +305,7 @@ mamba3-RE 原版里至少有：
 •	optional out projection norm；
 •	gated RMSNorm 相关路径。
 新版要求：
-在原版任何 norm 位置上添加开关，可以选择保留原版 norm，也可以改为 Derf。
+在原版任何 norm 位置上添加开关，可以选择保留原版 norm，也可以改为 Derf。Derf细节详见Derf.txt。
 可以抽象为：
 [
 \operatorname{NormSwitch}(x)=
